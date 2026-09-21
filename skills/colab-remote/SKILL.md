@@ -1,6 +1,6 @@
 ---
 name: colab-remote
-description: Run code on Google Colab from outside the browser. Use when driving a remote Colab session with the `colab` CLI (google-colab-cli) — `colab new/exec/run/upload/sessions/stop`, GPU/TPU/A100 or `--high-mem` runtimes, pushing local source to the VM, passing credentials without Drive — or when writing the bootstrap cell of a Colab notebook that installs a repo with uv, does an editable install, and pins pandas/numpy/pyarrow to the preinstalled versions. Covers the failure modes that are hard to diagnose: exec exiting 0 on exception, stale modules after editable install, `${name}` not expanding, drivemount blocking on /dev/tty.
+description: Run code on Google Colab from outside the browser. Use when driving a remote Colab session with the `colab` CLI (google-colab-cli) — `colab new/exec/run/upload/ssh/sessions/stop`, GPU/TPU/A100 or `--high-mem` runtimes, `--env` variables, pushing local source to the VM, passing credentials without Drive — or when writing the bootstrap cell of a Colab notebook that installs a repo with uv, does an editable install, and pins pandas/numpy/pyarrow to the preinstalled versions. Covers the failure modes that are hard to diagnose: exec exiting 0 on exception, `--env` secrets landing in plaintext history, `colab update --install` downgrading a git install, stale modules after editable install, `${name}` not expanding, drivemount blocking on /dev/tty.
 ---
 
 # Colab をリモート/ノートブックから動かす
@@ -15,6 +15,7 @@ description: Run code on Google Colab from outside the browser. Use when driving
 | 資格情報 | ローカルから `colab upload` で渡す | Colab のシークレット |
 
 Claude Code のセッションから回すなら基本は①。人間が図を見ながら試行錯誤するなら②。
+`colab url -s <session>` で①のセッションをブラウザのノートブックから開けるので、**後から②に合流することもできる**(同じ VM に繋がる)。
 どちらも共通の前提として、**依存は `uv.lock` から固定版を入れ、Python/pandas/numpy は Colab のプリインストール版に合わせる**(後述の「uv と Colab のバージョン整合」)。
 
 ---
@@ -23,15 +24,29 @@ Claude Code のセッションから回すなら基本は①。人間が図を�
 
 Google 公式の [`google-colab-cli`](https://github.com/googlecolab/google-colab-cli)(`colab` コマンド)。ローカルの shell から Colab のセッションを立て、任意のコードをカーネルで実行できる。
 
+### インストール(このスキルの検証済み構成: v0.7.1)
+
 ```bash
-uv tool install google-colab-cli --with "jupyter-kernel-client<1"
-colab whoami                        # 認証は ADC 推奨(--auth)。403 はスコープ不足
-colab new -s <session> --gpu A100   # セッションを立てる
-colab upload -s <session> local.tgz /content/local.tgz
-colab exec -s <session> -f task.py --timeout 900
-colab sessions
-colab stop -s <session>             # 止め忘れると課金が続く
+uv tool install --force "git+https://github.com/googlecolab/google-colab-cli@v0.7.1" \
+  --with "jupyter-kernel-client==0.8.0"
+colab version    # -> Version: 0.7.1
 ```
+
+- **PyPI 版は使わない。** タグは v0.7.1 まで出ているが、**PyPI の最新は 0.6.0 のまま**で `--high-mem` も `--env` も `colab ssh` も入っていない(2026-09-21 時点)。PyPI が 0.7 以降を出したら `uv tool install google-colab-cli --with ...` に戻してよい。
+- **`jupyter-kernel-client` の上限指定は今も必須。** PyPI の 1.x は `KernelClient` シンボル自体を廃止しており、入れると CLI が起動時に落ちる。`<1` でもよいが、実績があるのは 0.8.0。
+  (upstream の `uv.lock` は googlecolab フォークの `ColabKernelClient` を使うが、`uv tool install` では `tool.uv.sources` が効かず PyPI 版が入る。CLI 側は両対応済み。)
+- **`colab update --install` を実行しないこと。** 中身は `uv tool install -U google-colab-cli` で、**git 版を PyPI 版に置き換える**(今は 0.6.0 へのダウングレードになり、`--with` のピンも消える)。CLI は起動のたびにバックグラウンドで更新チェックをして1日1回バナーを出すが、無視してよい。
+
+### コマンドの見取り図
+
+| | |
+|---|---|
+| セッション | `colab new -s <name> [--gpu A100\|T4\|L4\|G4\|H100] [--tpu v5e1\|v6e1] [--high-mem]` / `sessions` / `status -s` / `stop -s` / `restart-kernel -s` |
+| 実行 | `colab exec -s <name> [-f file.py\|file.ipynb] [--timeout N] [--env K=V]` / `colab run script.py [args...]` / `repl` / `console` |
+| ファイル | `colab upload -s <name> LOCAL REMOTE` / `download` / `ls` / `rm` / `edit` |
+| その他 | `colab ssh -s <name>` / `colab url -s <name>`(ブラウザで開く) / `colab install -s <name> [-r req.txt]` / `colab log -s <name> -o out.ipynb` / `colab auth` / `colab drivemount` / `colab whoami`(ヘルプ非表示だが動く) |
+
+`colab readme` / `colab skill` で同梱ドキュメントを表示できる。認証は既定が `oauth2`(v0.6.0 からローカルの callback サーバではなく**リモートのコピペ方式**なのでヘッドレスでも通る)。GCP の ADC を使いたいときだけ `--auth adc`。
 
 ### ドライバの設計指針
 
@@ -46,27 +61,58 @@ colab stop -s <session>             # 止め忘れると課金が続く
 
 ### `colab exec` の罠
 
-- **例外が出ても終了コードは 0。** outputs を検査していない(伝播するのは `colab run` だけ)。そのままだと失敗を成功と報告する。**送るスクリプトの末尾に番兵の print を足し、その文字列が出力に現れたかどうかで完走を判定する**こと。
+- **例外が出ても終了コードは 0**(v0.7.1 で再確認)。outputs を検査していない(終了コードを伝播するのは `colab run` だけ)。そのままだと失敗を成功と報告する。**送るスクリプトの末尾に番兵の print を足し、その文字列が出力に現れたかどうかで完走を判定する**こと。
 - **既定タイムアウトは 30 秒。** 依存のインストールは数分かかるので `--timeout` が要る(ブートストラップは 900 秒程度)。subprocess 側のタイムアウトは CLI の値より余裕を持たせる。
 - **`sys.argv` を渡さない**(渡すのは `colab run`)。exec で流すスクリプトのパラメータは、引数ではなく**ファイル冒頭の定数**として書く。
 - **カーネルの状態は exec をまたいで残る。** ブートストラップで作った変数は後続のスクリプトからそのまま見える。ただしカーネル再起動で消えるので、タスクスクリプトの冒頭は冪等な `client = ensure_client()`(キャッシュ付き)にしておく。
 - **exec に渡したコードと出力は、ローカルの `~/.config/colab-cli/history/<session>.jsonl` に平文で残る。** 秘密情報を exec するコードに書かない・print しない。値の受け渡しは `colab upload`(履歴にはパスしか残らない)で行う。
 
+### `--env KEY=VALUE`(v0.7.0 で追加)— 秘密情報には使わない
+
+`colab exec` / `colab run` に付けられるが、実装は**実行するコードの先頭に `os.environ['KEY'] = 'VALUE'` を差し込むだけ**。その合成後のコードがそのまま履歴 jsonl に書かれるので、**渡した値は平文でローカルに残る**(実測で確認済み)。非秘密の設定値(`RUN_ID`, `DATASET=small` など)に限って使い、トークン類は従来どおり `colab upload` した JSON から読ませる。
+
+### `colab run`(使いどころが `exec` とは違う)
+
+```bash
+colab run --gpu A100 --high-mem --keep -s trainer train.py --epochs 10
+```
+
+- **終了コードを伝播する唯一の経路。** スクリプト側の `sys.exit(n)` は CPython と同じ `n` になり、それ以外の未捕捉例外は非ゼロになる。番兵 print が要らない。
+- スクリプト本体はローカルから読んで送られ、`sys.argv` と `__name__ == "__main__"` が正しく立つ。
+- **ただし毎回まっさらな VM を確保する。** `-s <name>` を付けても既存セッションの再利用はしない(名前が付くだけ)。`--keep` を付ければ終了後も残り、以降は `colab exec -s <name>` で同じカーネルに繋げる。
+- 既定 `--timeout` は exec と同じく 30 秒。
+
+したがって「重いセットアップを1回だけして何度も回す」用途は今も `new` + `upload` + `exec`(+ 番兵)で、「単発のスクリプトを投げて結果と終了コードだけ欲しい」用途は `run` が素直。
+
+### `colab ssh`(v0.7.0 で追加、未検証)
+
+SSH-over-WebSocket で VM に shell が取れる。`--proxy-mode` は OpenSSH の `ProxyCommand` として使えるので、VS Code Remote-SSH などの IDE リモート開発が通る。
+
+```
+Host colab
+  ProxyCommand /Users/<user>/.local/bin/colab ssh --proxy-mode -s <name> [--gpu T4] [--rm]
+  User root
+  StrictHostKeyChecking no
+  UserKnownHostsFile /dev/null
+```
+
+- **鍵は ed25519 か ecdsa。`ssh-rsa` はサーバ側で拒否される。** 鍵が無いと `no SSH public key found in ~/.ssh/` で止まる(`ssh-keygen -t ed25519`)。
+- `ProxyCommand` には `colab` の**絶対パス**を書く(非ログインシェルで PATH が通らない)。
+- サーバ側が `/colab/ssh` を提供していないランタイムでは **HTTP 404** になる。その場合は諦めて `exec` 経路に戻る。
+- `-s` 無しの `colab ssh` はセッションが無ければ自動で立てる。`--rm` は**自動で立てた場合のみ**終了時に停止する(既存セッションは消さない)。
+
 ### セッションが生きているかどうか
 
-- **アイドルのセッションはサーバ側で回収される**(CPU で数十分〜)。ローカルの記録だけが残るので、**送る前に生存確認する**(`colab exec` で `print('__alive__')` を流して返ってくるか)。死んだセッションへの `upload` は `File or directory not found` という分かりにくい失敗になる。回収されていれば作り直す。
+- **アイドルのセッションはサーバ側で回収される**(CPU で数十分〜)。ローカルの記録だけが残るので、**送る前に生存確認する**(`colab exec` で `print('__alive__')` を流して返ってくるか、`colab status -s <name>`)。死んだセッションへの `upload` は `File or directory not found` という分かりにくい失敗になる。回収されていれば作り直す。
 - **`colab sessions` の `[?]` はローカルに記録が無いサーバ側の割り当て。** 名前が無いので `exec` も `stop` もできない。Web UI から切るか、24時間の keep-alive 上限で回収されるのを待つ。
 - **ローカルで Ctrl-C しても、リモートのカーネルは走り続ける。** exec を止めても VM 側の処理は継続し、次の exec が詰まって時間切れになる。止めるには `colab restart-kernel -s <session>`(カーネルの状態は消えるので `up` で入れ直す)。
+- **確保に失敗すると "Allocation refused (precondition failed)"**(HTTP 412)。セッションの持ちすぎか、そのアクセラレータの一時的な枠不足。`colab stop` で空けるか、別のアクセラレータにする。
 
 ### CLI セッション固有の制約
 
-- **`google.colab.userdata` が使えない。** userdata の解決はフロントエンドへの `colab_request` 経由だが、`colab` CLI がハンドラを持っているのは Drive マウントだけで、シークレットには応答が返らない。**CLI 経路の資格情報はローカルから渡す**(`colab upload` で JSON を置き、VM 側は「既存の環境変数 > その JSON」の順で解決する)。ノートブック経路のコードは `userdata` を読む実装のまま残しておけば、同じ関数が両方で動く。
+- **`google.colab.userdata` が使えない。** userdata の解決はフロントエンドへの `colab_request` 経由だが、`colab` CLI がハンドラを持っているのは今も Drive マウントだけで、シークレットには応答が返らない。**CLI 経路の資格情報はローカルから渡す**(`colab upload` で JSON を置き、VM 側は「既存の環境変数 > その JSON」の順で解決する)。ノートブック経路のコードは `userdata` を読む実装のまま残しておけば、同じ関数が両方で動く。
 - **`colab drivemount` は毎回ブラウザでの許可を求め、`/dev/tty` から Enter を待つ。** Drive の資格情報は VM ごとの ephemeral 発行なので、前のセッションで許可済みでも新しいセッションでは効かない。**非対話シェルでは待たずに `mount failed` になる**。どうしても要るなら対話的な端末から実行する(Claude Code のセッションなら `! colab drivemount -s <session> /content/drive`)。後述の設計にすれば、そもそも Drive が要らなくなる。
-- **`--high-mem`(high-RAM)はリリース版に入っていない。** upstream の main にはある(b04e83a, 2026-08-11 / `shape=hm` を assign に送る)が、PyPI も最新タグも v0.6.0 でこのコミットより前。使うなら git 版(`0.6.1.dev8+gb04e83a92` 以降)を入れる:
-  ```bash
-  uv tool install --force "git+https://github.com/googlecolab/google-colab-cli" --with "jupyter-kernel-client<1"
-  ```
-  ドライバ側は `colab new --help` に `--high-mem` があるかを見てから渡し、無ければその場で理由を出す。
+- **`--high-mem`(high-RAM)は v0.7.0 からリリースに入った**が、PyPI は 0.6.0 のままなので上記の git インストールが要る。`colab new -s x --high-mem` → `colab status -s x` が `Shape: High-RAM` になれば効いている。**Colab Pro / Pro+ が必要**で、**単一シェイプしか無いアクセラレータ(L4, TPU v5e1/v6e1)では警告して無視される**。CPU・T4・A100 では有効。
 
 ### 資格情報の渡し方(Drive が要らなくなる設計)
 
@@ -167,7 +213,7 @@ print('bootstrap OK:', <pkg>.__file__)           # ここが出れば環境構�
 ## uv と Colab のバージョン整合(両経路に共通)
 
 - **requirements.txt を手書きしない。** 真実は `uv.lock` 一箇所に置き、`uv export --frozen --no-dev --no-hashes --no-emit-project` で生成する。生成物はコミットしない。
-- **Python / pandas / numpy は Colab のプリインストール版に完全固定する。** 実測値を確認してから `uv add` し、`.python-version` と `requires-python` も揃える。ずれていると Colab 側で再インストールが走り、同梱ライブラリを壊す。
+- **Python / pandas / numpy は Colab のプリインストール版に完全固定する。** 実測値を確認してから `uv add` し、`.python-version` と `requires-python` も揃える。ずれていると Colab 側で再インストールが走り、同梱ライブラリを壊す。(2026-09 時点の CPU ランタイムは Python 3.13.15 / x86_64。)
 - **pyarrow を runtime 依存に入れない**(dev グループへ)。バージョンを上書きすると `pyarrow.lib.IpcReadOptions size changed` のバイナリ非互換が起き、pandas は `except ImportError` しか捕まえないので **`import pandas` ごと落ちてカーネルの再起動が必要になる**。`to_parquet()` などは関数内で遅延 import しておく。ブートストラップを `--no-dev` で回せば dev グループは入らない。
 - 大きな依存(torch など)も optional group に切り出し、**Colab のプリインストール版を使う**。毎セッション数 GB の再取得を避けられる。
 - GPU は必要なときだけ(`--gpu A100`)。スモークテストは CPU か弱い GPU で十分。CPU のみで RAM が要るケースは `--high-mem`。
