@@ -15,7 +15,7 @@ description: Run code on Google Colab from outside the browser. Use when driving
 | 資格情報 | ローカルから `colab upload` で渡す | Colab のシークレット |
 
 Claude Code のセッションから回すなら基本は①。人間が図を見ながら試行錯誤するなら②。
-`colab url -s <session>` で①のセッションをブラウザのノートブックから開けるので、**後から②に合流することもできる**(同じ VM に繋がる)。
+**①と②は合流できない。** `colab url` は空の scratchpad を開くだけで CLI のセッションには繋がらない(upstream issue #24、未修正)。詳細と代替は後述の「ノートブックとして残す」。
 どちらも共通の前提として、**依存は `uv.lock` から固定版を入れ、Python/pandas/numpy は Colab のプリインストール版に合わせる**(後述の「uv と Colab のバージョン整合」)。
 
 ---
@@ -44,7 +44,7 @@ colab version    # -> Version: 0.7.1
 | セッション | `colab new -s <name> [--gpu A100\|T4\|L4\|G4\|H100] [--tpu v5e1\|v6e1] [--high-mem]` / `sessions` / `status -s` / `stop -s` / `restart-kernel -s` |
 | 実行 | `colab exec -s <name> [-f file.py\|file.ipynb] [--timeout N] [--env K=V]` / `colab run script.py [args...]` / `repl` / `console` |
 | ファイル | `colab upload -s <name> LOCAL REMOTE` / `download` / `ls` / `rm` / `edit` |
-| その他 | `colab ssh -s <name>` / `colab url -s <name>`(ブラウザで開く) / `colab install -s <name> [-r req.txt]` / `colab log -s <name> -o out.ipynb` / `colab auth` / `colab drivemount` / `colab whoami`(ヘルプ非表示だが動く) |
+| その他 | `colab ssh -s <name>` / `colab install -s <name> [-r req.txt]` / `colab log -s <name> -o out.ipynb` / `colab auth` / `colab drivemount` / `colab whoami`(ヘルプ非表示だが動く) / `colab url`(**壊れている**、後述) |
 
 `colab readme` / `colab skill` で同梱ドキュメントを表示できる。認証は既定が `oauth2`(v0.6.0 からローカルの callback サーバではなく**リモートのコピペ方式**なのでヘッドレスでも通る)。GCP の ADC を使いたいときだけ `--auth adc`。
 
@@ -100,6 +100,20 @@ Host colab
 - `ProxyCommand` には `colab` の**絶対パス**を書く(非ログインシェルで PATH が通らない)。
 - サーバ側が `/colab/ssh` を提供していないランタイムでは **HTTP 404** になる。その場合は諦めて `exec` 経路に戻る。
 - `-s` 無しの `colab ssh` はセッションが無ければ自動で立てる。`--rm` は**自動で立てた場合のみ**終了時に停止する(既存セッションは消さない)。
+
+### ノートブックとして残す(ブラウザで開きたいとき)
+
+**`colab url` は使えない。** 出てくるのは `notebooks/empty.ipynb?dbu=...` で、開いても空の scratchpad がランタイム未接続で出るだけ。「接続」を押すと CLI のセッションではなく**新しい CPU VM を確保してしまう**(upstream issue #24、2026-05-24 起票・未修正、2026-09 時点で fix 待ち)。CLI のセッションはブラウザ側からは「不明なノートブック」としてしか見えない。
+
+代わりに、**実行履歴をノートブックに書き出す**:
+
+```bash
+colab log -s <name> -o session.ipynb    # .ipynb / .md / .txt / .jsonl
+```
+
+`exec` で流したセルが**出力込みで**順に並んだ `.ipynb` が得られる(先頭にセッション情報の markdown セル付き)。ローカルの Jupyter/VS Code で開けるし、Drive や GitHub に置けば Colab でも開ける — ただしその場合ランタイムは新規になる。
+
+逆向き(`.ipynb` を投げて回す)は `colab exec -s <name> -f nb.ipynb` で、セルごとに実行しつつローカルに `nb_output.ipynb` を書き出す。**「ノートブックを正本にして CLI で回し、結果を ipynb で受け取る」のが現実的な運用**で、ブラウザ UI にライブで合流する経路は今のところ無い。
 
 ### セッションが生きているかどうか
 
